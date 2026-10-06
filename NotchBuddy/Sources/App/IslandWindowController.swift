@@ -14,6 +14,7 @@ final class IslandWindowController: NSWindowController {
     private var wasInIsland = false
     private var frameTimer: Timer?
     private var keyMonitor: Any?
+    private var outsideClickMonitor: Any?
     private var viewSubscription: AnyCancellable?
 
     // Confused recovery timer (set by handleDizzy)
@@ -565,6 +566,16 @@ final class IslandWindowController: NSWindowController {
     // MARK: - Keyboard (Escape closes)
 
     private func startKeyMonitor() {
+        // A click anywhere outside Coucou folds the expanded island, like Escape.
+        // Global monitors only see events sent to other apps, so clicks on the island
+        // (and on desktop Mochi) never get here. Pinned (⌘P) or waiting on an approval: stays.
+        outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.state.mode == .expanded, !self.state.isPinned else { return }
+                self.collapse()
+            }
+        }
+
         keyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
             Task { @MainActor in
                 guard let self = self else { return }
