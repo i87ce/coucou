@@ -221,13 +221,7 @@ struct OverviewView: View {
         case "agent_gemini", "agent_antigravity",
              "agent_copilot", "agent_muse", "agent_opencode", "agent_amp":
             #if !APPSTORE
-            let terminalBundleIds = ["com.apple.Terminal", "com.googlecode.iterm2",
-                                     "net.kovidgoyal.kitty", "com.mitchellh.ghostty"]
-            if let hit = terminalBundleIds.compactMap({ id in
-                NSWorkspace.shared.runningApplications.first { $0.bundleIdentifier == id }
-            }).first {
-                hit.activate(options: .activateIgnoringOtherApps)
-            }
+            TerminalJumper.open(task)
             #endif
         case "ai_anthropic":
             switchChatProvider(.anthropic)
@@ -251,13 +245,7 @@ struct OverviewView: View {
                 }
             } else {
                 #if !APPSTORE
-                let terminalBundleIds = ["com.apple.Terminal", "com.googlecode.iterm2",
-                                         "net.kovidgoyal.kitty", "com.mitchellh.ghostty"]
-                if let hit = terminalBundleIds.compactMap({ id in
-                    NSWorkspace.shared.runningApplications.first { $0.bundleIdentifier == id }
-                }).first {
-                    hit.activate(options: .activateIgnoringOtherApps)
-                }
+                TerminalJumper.open(task)
                 #endif
             }
         }
@@ -565,13 +553,7 @@ struct FinishedView: View {
                 HStack(spacing: 8) {
                     #if !APPSTORE
                     PrimaryButton("Open terminal") {
-                        let terminalBundleIds = ["com.apple.Terminal", "com.googlecode.iterm2", "net.kovidgoyal.kitty", "com.mitchellh.ghostty"]
-                        let activated = terminalBundleIds.compactMap { id in
-                            NSWorkspace.shared.runningApplications.first { $0.bundleIdentifier == id }
-                        }.first.map { $0.activate(options: .activateIgnoringOtherApps) }
-                        if activated == nil {
-                            NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app"))
-                        }
+                        TerminalJumper.open(state.focusTask, launchTerminalIfNone: true)
                         NotificationCenter.default.post(name: .islandCollapse, object: nil)
                     }
                     #endif
@@ -1645,8 +1627,8 @@ struct IntegrationCardView: View {
             #else
             return false
             #endif
-        case "ai_anthropic":  return KeychainStore.shared.get("anthropic-api-key") != nil
-        case "ai_google":     return KeychainStore.shared.get("google-api-key")    != nil
+        case "ai_anthropic":  return ChatProvider.anthropic.hasCloudCredentials
+        case "ai_google":     return ChatProvider.google.hasCloudCredentials
         case "ai_openai":     return KeychainStore.shared.get("openai-api-key")    != nil
         case "ai_ollama":     return !AppState.shared.ollamaServerURL.isEmpty
         case "ai_lmstudio":   return !AppState.shared.lmstudioServerURL.isEmpty
@@ -3690,40 +3672,54 @@ struct AgentPillsView: View {
     ]
 
     var body: some View {
-        VStack(spacing: 0) {
-            Spacer(minLength: 0)
-            LazyVGrid(columns: columns, spacing: 4) {
-                ForEach(displayTasks) { task in
-                    #if !APPSTORE
-                    if task.id == "integration_music" {
-                        MusicPill(task: task, state: state, swapping: $swapping) {
-                            swapping = true
-                            state.setFocus(task.id)
-                            SoundEngine.shared.play("blip")
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { swapping = false }
-                        }
-                    } else {
-                        AgentPill(task: task, state: state, swapping: $swapping) {
-                            swapping = true
-                            state.setFocus(task.id)
-                            SoundEngine.shared.play("blip")
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { swapping = false }
-                        }
+        if others.count > 4 {
+            // More pills than the 2×2 grid holds (one per iTerm2 tab, say): same grid, scrollable.
+            ScrollView(.vertical, showsIndicators: false) {
+                pillGrid(others)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            VStack(spacing: 0) {
+                Spacer(minLength: 0)
+                pillGrid(displayTasks)
+                    .padding(.horizontal, 8)
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    @ViewBuilder private func pillGrid(_ tasks: [AgentTask]) -> some View {
+        LazyVGrid(columns: columns, spacing: 4) {
+            ForEach(tasks) { task in
+                #if !APPSTORE
+                if task.id == "integration_music" {
+                    MusicPill(task: task, state: state, swapping: $swapping) {
+                        swapping = true
+                        state.setFocus(task.id)
+                        SoundEngine.shared.play("blip")
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { swapping = false }
                     }
-                    #else
+                } else {
                     AgentPill(task: task, state: state, swapping: $swapping) {
                         swapping = true
                         state.setFocus(task.id)
                         SoundEngine.shared.play("blip")
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { swapping = false }
                     }
-                    #endif
                 }
+                #else
+                AgentPill(task: task, state: state, swapping: $swapping) {
+                    swapping = true
+                    state.setFocus(task.id)
+                    SoundEngine.shared.play("blip")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { swapping = false }
+                }
+                #endif
             }
-            .padding(.horizontal, 8)
-            Spacer(minLength: 0)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
@@ -3766,6 +3762,9 @@ struct AgentPill: View {
                         .lineLimit(1)
                         .truncationMode(.tail)
                         .frame(maxWidth: .infinity, alignment: .center)
+                        // Keep long names (iTerm2 tab titles) clear of the mini Mochi on the left.
+                        .padding(.leading, 32)
+                        .padding(.trailing, 8)
                 }
                 .frame(maxWidth: .infinity)
                 .frame(height: 28)
@@ -4650,7 +4649,7 @@ struct SettingsIslandView: View {
     }
 
     private var apiConnected: Bool {
-        KeychainStore.shared.get("anthropic-api-key") != nil
+        ChatProvider.anthropic.hasCloudCredentials
     }
 
     var body: some View {

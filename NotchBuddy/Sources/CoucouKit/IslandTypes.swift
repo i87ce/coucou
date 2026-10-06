@@ -60,6 +60,8 @@ struct AgentTask: Identifiable, Equatable {
     var pillBadge: PillBadge? = nil  // alert badge shown on pill when not focused
     var sessionCwd: String?  = nil  // last known working directory (Claude Code sessions)
     var finalLine: String?   = nil  // last assistant message shown as static text after Stop
+    var terminalSessionId: String? = nil  // ITERM_SESSION_ID of an iTerm2 session, to jump to its tab
+    var terminalTitle: String? = nil      // iTerm2 tab title, preferred over the folder name as pill name
 }
 
 enum AgentSource: Equatable {
@@ -99,7 +101,7 @@ enum ChatProvider: String, CaseIterable, Codable {
 
     var defaultModel: String {
         switch self {
-        case .anthropic: "claude-sonnet-4-6"
+        case .anthropic: "claude-opus-5-5[1m]"
         case .google:    "gemini-2.0-flash"
         case .openai:    "gpt-4o"
         case .ollama:    "llama3.2"
