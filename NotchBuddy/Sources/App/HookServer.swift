@@ -338,6 +338,8 @@ final class HookServer: @unchecked Sendable {
 
         let termProgram = payload["term_program"] as? String ?? ""
         let bundleId    = payload["bundle_id"]    as? String ?? ""
+        let ttyPath = payload["tty"] as? String ?? ""
+        let itermSession = ttyPath.isEmpty ? payload["iterm_session_id"] as? String ?? "" : ttyPath
 
         // Cursor identified solely by its stable Electron bundle ID.
         // ToDesktop builds other apps too — do not match on "todesktop" alone.
@@ -351,6 +353,7 @@ final class HookServer: @unchecked Sendable {
         // • other valid coucou_agent → external pill (fire-and-forget, no approval card)
         // • Cursor bundle ID → agent_cursor
         // • VS Code → integration_claude
+        // • iTerm2 → one pill per session, iterm_<session>
         #if !APPSTORE
         let isCodexEvent = rawAgent == "codex"
         #else
@@ -370,6 +373,10 @@ final class HookServer: @unchecked Sendable {
         } else if isVSCodeEditor {
             agentId = "integration_claude"
             isExternalAgent = false
+        } else if let itermId = Self.itermPillId(termProgram: termProgram, bundleId: bundleId,
+                                                 tty: ttyPath, sessionId: sessionId) {
+            agentId = itermId
+            isExternalAgent = false
         } else {
             nbLog("Ignored \(name) from \(termProgram.isEmpty ? bundleId : termProgram) (\(projectName))")
             return
@@ -385,12 +392,7 @@ final class HookServer: @unchecked Sendable {
         // While a permission request is pending, dismiss when the resolving event arrives,
         // then continue normal processing. Only skip normal processing when unresolved.
         if let pending = state.pendingApproval, agentId == pending.pillId {
-            let handledNote: String
-            switch pending.pillId {
-            case "agent_cursor": handledNote = "Handled in Cursor."
-            case "agent_codex":  handledNote = "Handled in Codex."
-            default:             handledNote = "Handled in VS Code."
-            }
+            let handledNote = "Handled in \(Self.hostName(forPill: pending.pillId))."
             var resolved = false
             switch name {
             case "PostToolUse", "PostToolUseFailure":
@@ -418,7 +420,7 @@ final class HookServer: @unchecked Sendable {
 
         case "SessionStart":
             activeSessionId = sessionId
-            if isExternalAgent { upsertExternalAgent(id: agentId, name: validAgent!) } else { upsertWorkspaceTask(id: agentId, projectName: projectName, cwd: cwd) }
+            if isExternalAgent { upsertExternalAgent(id: agentId, name: validAgent!) } else { upsertWorkspaceTask(id: agentId, projectName: projectName, cwd: cwd, terminalSessionId: itermSession) }
             if let idx = state.tasks.firstIndex(where: { $0.id == agentId }) { state.tasks[idx].finalLine = nil }
             nbLog("SessionStart \(isExternalAgent ? agentId : projectName) (\(sessionId.prefix(8)))")
             if state.isPresent { expandIfNeeded(to: .overview) }
@@ -426,7 +428,7 @@ final class HookServer: @unchecked Sendable {
 
         case "UserPromptSubmit":
             activeSessionId = sessionId
-            if isExternalAgent { upsertExternalAgent(id: agentId, name: validAgent!) } else { upsertWorkspaceTask(id: agentId, projectName: projectName, cwd: cwd) }
+            if isExternalAgent { upsertExternalAgent(id: agentId, name: validAgent!) } else { upsertWorkspaceTask(id: agentId, projectName: projectName, cwd: cwd, terminalSessionId: itermSession) }
             if let idx = state.tasks.firstIndex(where: { $0.id == agentId }) { state.tasks[idx].finalLine = nil }
             state.updateTask(id: agentId, state: .thinking)
             if let prompt = payload["prompt"] as? String, !prompt.isEmpty {
@@ -441,7 +443,7 @@ final class HookServer: @unchecked Sendable {
             // AskUserQuestion is handled via the dedicated --ask hook.
             // Skip state/step update here to avoid flickering over the question card.
             guard tool != "AskUserQuestion" else { break }
-            if isExternalAgent { upsertExternalAgent(id: agentId, name: validAgent!) } else { upsertWorkspaceTask(id: agentId, projectName: projectName, cwd: cwd) }
+            if isExternalAgent { upsertExternalAgent(id: agentId, name: validAgent!) } else { upsertWorkspaceTask(id: agentId, projectName: projectName, cwd: cwd, terminalSessionId: itermSession) }
             state.updateTask(id: agentId, state: .working)
             let input = payload["tool_input"] as? [String: Any] ?? [:]
             let step = frenchStep(tool: tool, input: input)
@@ -529,6 +531,69 @@ final class HookServer: @unchecked Sendable {
 
         default:
             break
+        }
+    }
+
+    // MARK: - iTerm2 sessions
+
+    /// Claude Code running in an iTerm2 tab gets one pill per tab: "iterm_<tty>", the same id ItermScanner
+    /// gives the tab, so hook events and scans land on one pill. The tty is used rather than the tab's
+    /// ITERM_SESSION_ID, which goes stale in the agent's environment when iTerm2 restarts and restores the
+    /// tab under a new id. Falls back to the Claude session id. Returns nil when the event is not from iTerm2.
+    static func itermPillId(termProgram: String, bundleId: String, tty: String, sessionId: String) -> String? {
+        guard termProgram == "iTerm.app" || bundleId.lowercased() == "com.googlecode.iterm2" else { return nil }
+        if !tty.isEmpty { return itermPillId(tty: tty) }
+        return sessionId == "unknown" ? nil : "iterm_" + sessionId.prefix(8)
+    }
+
+    /// "/dev/ttys008" → "iterm_ttys008".
+    static func itermPillId(tty: String) -> String {
+        "iterm_" + (tty as NSString).lastPathComponent
+    }
+
+    /// Mirrors the iTerm2 tabs running Claude Code: one pill per tab, in tab order right after the
+    /// main pill; pills of tabs where Claude Code is gone are removed (unless a card is waiting on them).
+    @MainActor
+    func syncItermTabs(_ tabs: [ItermTab]) {
+        let state = AppState.shared
+        let liveIds = Set(tabs.map { Self.itermPillId(tty: $0.tty) })
+        let busyIds = Set([state.pendingApproval?.pillId, questionPillId].compactMap { $0 })
+        for task in state.tasks where task.id.hasPrefix("iterm_") && !liveIds.contains(task.id) && !busyIds.contains(task.id) {
+            state.clearSessionDiffs(for: task.id)
+            state.removeTask(id: task.id)
+        }
+        for tab in tabs {
+            let id = Self.itermPillId(tty: tab.tty)
+            let folder = tab.cwd.isEmpty ? "Claude Code" : aliasProjectName(URL(fileURLWithPath: tab.cwd).lastPathComponent)
+            if let idx = state.tasks.firstIndex(where: { $0.id == id }) {
+                state.tasks[idx].terminalTitle = tab.title.isEmpty ? nil : tab.title
+                state.tasks[idx].name = tab.title.isEmpty ? folder : tab.title
+                state.tasks[idx].terminalSessionId = tab.tty
+                if !tab.cwd.isEmpty { state.tasks[idx].sessionCwd = tab.cwd }
+            } else {
+                upsertWorkspaceTask(id: id, projectName: folder, cwd: tab.cwd, terminalSessionId: tab.tty)
+                if let idx = state.tasks.firstIndex(where: { $0.id == id }), !tab.title.isEmpty {
+                    state.tasks[idx].terminalTitle = tab.title
+                    state.tasks[idx].name = tab.title
+                }
+            }
+        }
+        // Tab order, right after the main pill.
+        let order = tabs.map { Self.itermPillId(tty: $0.tty) }
+        let iterm = order.compactMap { id in state.tasks.first { $0.id == id } }
+        guard !iterm.isEmpty else { return }
+        var rest = state.tasks.filter { !$0.id.hasPrefix("iterm_") || !order.contains($0.id) }
+        let at = rest.firstIndex(where: { $0.id == state.mainPillId }).map { $0 + 1 } ?? 0
+        rest.insert(contentsOf: iterm, at: at)
+        if rest.map(\.id) != state.tasks.map(\.id) { state.tasks = rest }
+    }
+
+    /// App named in the approval card notes ("Handled in …", "Still waiting in …").
+    static func hostName(forPill pillId: String) -> String {
+        switch pillId {
+        case "agent_cursor": return "Cursor"
+        case "agent_codex":  return "Codex"
+        default:             return pillId.hasPrefix("iterm_") ? "iTerm2" : "VS Code"
         }
     }
 
@@ -640,15 +705,20 @@ final class HookServer: @unchecked Sendable {
         }
 
         // Determine which workspace pill owns the request.
+        let itermPillId = Self.itermPillId(termProgram: termProgram, bundleId: bundleId,
+                                           tty: payload["tty"] as? String ?? "",
+                                           sessionId: sessionId)
         let pillId: String
         if isCodexRequest {
             pillId = "agent_codex"
         } else if isCursorEditor {
             pillId = "agent_cursor"
+        } else if let itermPillId, !isVSCodeEditor {
+            pillId = itermPillId
         } else {
             pillId = "integration_claude"
         }
-        guard isCodexRequest || isCursorEditor || isVSCodeEditor else {
+        guard isCodexRequest || isCursorEditor || isVSCodeEditor || itermPillId != nil else {
             Task.detached { [weak self] in
                 self?.sendLine(fd: fd, text: #"{"permissionDecision":"ask"}"#)
                 close(fd)
@@ -689,7 +759,8 @@ final class HookServer: @unchecked Sendable {
         pendingApprovalFD = fd
         activeSessionId = sessionId
 
-        upsertWorkspaceTask(id: pillId, projectName: projectName, cwd: cwd)
+        upsertWorkspaceTask(id: pillId, projectName: projectName, cwd: cwd,
+                            terminalSessionId: payload["tty"] as? String ?? payload["iterm_session_id"] as? String ?? "")
         state.updateTask(id: pillId, state: .approval)
         state.pendingApproval = ApprovalInfo(sessionId: sessionId, tool: tool,
                                               command: command, inputKey: inputKey, pillId: pillId)
@@ -708,12 +779,7 @@ final class HookServer: @unchecked Sendable {
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
         source.setEventHandler { [weak self] in
             guard let self, self.pendingApprovalFD == fd else { return }
-            let note: String
-            switch capturedPillId {
-            case "agent_cursor": note = "Handled in Cursor."
-            case "agent_codex":  note = "Handled in Codex."
-            default:             note = "Handled in VS Code."
-            }
+            let note = "Handled in \(Self.hostName(forPill: capturedPillId))."
             self.dismissApprovalCard(note: note)
         }
         source.setCancelHandler { close(fd) }
@@ -725,12 +791,7 @@ final class HookServer: @unchecked Sendable {
         let captured = fd
         DispatchQueue.main.asyncAfter(deadline: .now() + 115) { [weak self] in
             guard let self, self.pendingApprovalFD == captured else { return }
-            let note: String
-            switch capturedPillId {
-            case "agent_cursor": note = "Still waiting in Cursor."
-            case "agent_codex":  note = "Still waiting in Codex."
-            default:             note = "Still waiting in VS Code."
-            }
+            let note = "Still waiting in \(Self.hostName(forPill: capturedPillId))."
             self.dismissApprovalCard(note: note)
         }
     }
@@ -803,15 +864,20 @@ final class HookServer: @unchecked Sendable {
         #else
         let isCodexRequest = false
         #endif
+        let itermPillId = Self.itermPillId(termProgram: termProgram, bundleId: bundleId,
+                                           tty: payload["tty"] as? String ?? "",
+                                           sessionId: sessionId)
         let pillId: String
         if isCodexRequest {
             pillId = "agent_codex"
         } else if isCursorEditor {
             pillId = "agent_cursor"
+        } else if let itermPillId, !isVSCodeEditor {
+            pillId = itermPillId
         } else {
             pillId = "integration_claude"
         }
-        guard isCodexRequest || isCursorEditor || isVSCodeEditor else {
+        guard isCodexRequest || isCursorEditor || isVSCodeEditor || itermPillId != nil else {
             Task.detached { [weak self] in
                 self?.sendLine(fd: fd, text: #"{"permissionDecision":"ask"}"#)
                 close(fd)
@@ -833,7 +899,8 @@ final class HookServer: @unchecked Sendable {
         activeSessionId = sessionId
         questionPillId = pillId
 
-        upsertWorkspaceTask(id: pillId, projectName: projectName, cwd: cwd)
+        upsertWorkspaceTask(id: pillId, projectName: projectName, cwd: cwd,
+                            terminalSessionId: payload["tty"] as? String ?? payload["iterm_session_id"] as? String ?? "")
         state.updateTask(id: pillId, state: .question)
         state.pendingQuestion = parsed
         state.isPinned = true
@@ -872,19 +939,29 @@ final class HookServer: @unchecked Sendable {
     /// If the task already exists (persistent), just updates name/cwd.
     /// If missing (transient), creates it and inserts after the main pill.
     @MainActor
-    private func upsertWorkspaceTask(id: String, projectName: String, cwd: String = "") {
+    private func upsertWorkspaceTask(id: String, projectName: String, cwd: String = "",
+                                     terminalSessionId: String = "") {
         let state = AppState.shared
         if let idx = state.tasks.firstIndex(where: { $0.id == id }) {
-            state.tasks[idx].name = projectName
+            state.tasks[idx].name = state.tasks[idx].terminalTitle ?? projectName
             if !cwd.isEmpty { state.tasks[idx].sessionCwd = cwd }
+            if !terminalSessionId.isEmpty { state.tasks[idx].terminalSessionId = terminalSessionId }
             return
         }
         // Transient: create and insert after the main pill
         let def = PillCatalog.definition(for: id)
-        let color = def?.color ?? "#C0C4CC"
-        let source = def?.source ?? .agent
-        let task = AgentTask(id: id, name: projectName, color: color,
-                             state: .idle, steps: [], source: source, isIntegration: true)
+        var task: AgentTask
+        if id.hasPrefix("iterm_") {
+            // iTerm2 sessions are not in the catalog: coloured by project and shown
+            // with the session card (name + ticker), like third-party agents.
+            task = AgentTask(id: id, name: projectName, color: IslandConst.colorForProject(projectName),
+                             state: .idle, steps: [], source: .claudeCode)
+            task.sessionCwd = cwd.isEmpty ? nil : cwd
+            task.terminalSessionId = terminalSessionId.isEmpty ? nil : terminalSessionId
+        } else {
+            task = AgentTask(id: id, name: projectName, color: def?.color ?? "#C0C4CC",
+                             state: .idle, steps: [], source: def?.source ?? .agent, isIntegration: true)
+        }
         if let mainIdx = state.tasks.firstIndex(where: { $0.id == state.mainPillId }) {
             state.tasks.insert(task, at: mainIdx + 1)
         } else {
@@ -1894,6 +1971,35 @@ private let nbHookPythonGitHub = """
 # Reads JSON from stdin, forwards to Coucou via Unix socket, translates response.
 import sys, json, os, socket
 
+def own_tty():
+    # Controlling terminal of the agent (e.g. /dev/ttys008). Stable across iTerm2 restarts,
+    # unlike ITERM_SESSION_ID, which stays stale in the agent's environment.
+    try:
+        fd = os.open('/dev/tty', os.O_RDONLY | os.O_NOCTTY)
+        try:
+            return os.ttyname(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+    # Hooks often run without a controlling terminal: walk up to the first ancestor that has one.
+    if os.environ.get('TERM_PROGRAM', '') != 'iTerm.app':
+        return ''
+    import subprocess
+    pid = os.getppid()
+    for _ in range(6):
+        try:
+            f = subprocess.run(['/bin/ps', '-o', 'tty=,ppid=', '-p', str(pid)],
+                               capture_output=True, text=True, timeout=2).stdout.split()
+        except Exception:
+            return ''
+        if len(f) < 2:
+            return ''
+        if f[0] not in ('??', '-'):
+            return '/dev/' + f[0]
+        pid = int(f[1])
+    return ''
+
 def normalize_event(name):
     mapping = {
         'BeforeTool': 'PreToolUse', 'BeforeToolSelection': 'PreToolUse',
@@ -1989,6 +2095,7 @@ def main():
         env = os.environ
         payload.setdefault('term_program', env.get('TERM_PROGRAM', ''))
         payload.setdefault('iterm_session_id', env.get('ITERM_SESSION_ID', ''))
+        payload.setdefault('tty', own_tty())
         payload.setdefault('term_session_id', env.get('TERM_SESSION_ID', ''))
         payload.setdefault('bundle_id', env.get('__CFBundleIdentifier', ''))
         if 'cwd' not in payload or not payload['cwd']:
@@ -2052,6 +2159,7 @@ def main():
     env = os.environ
     payload.setdefault('term_program', env.get('TERM_PROGRAM', ''))
     payload.setdefault('iterm_session_id', env.get('ITERM_SESSION_ID', ''))
+    payload.setdefault('tty', own_tty())
     payload.setdefault('term_session_id', env.get('TERM_SESSION_ID', ''))
     payload.setdefault('bundle_id', env.get('__CFBundleIdentifier', ''))
     if 'cwd' not in payload or not payload['cwd']:

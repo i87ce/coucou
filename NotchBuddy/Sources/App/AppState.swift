@@ -83,7 +83,7 @@ final class AppState: ObservableObject {
     }
 
     // Claude model used by the chat and the search — persisted
-    static let defaultClaudeModel = "claude-sonnet-4-6"
+    static let defaultClaudeModel = "claude-opus-5-5[1m]"
     @Published var claudeModel: String = AppState.defaultClaudeModel {
         didSet { UserDefaults.standard.set(claudeModel, forKey: "claudeModel") }
     }
@@ -156,6 +156,29 @@ final class AppState: ObservableObject {
                     }
                 case .failure:
                     providerModelFetchError[provider] = "Cannot reach \(normalised). Is the server running?"
+                }
+            }
+            return
+        }
+        // Anthropic and Google through Vertex AI: no API key
+        if VertexAI.serves(provider) {
+            loadingProviderModels.insert(provider)
+            providerModelFetchError.removeValue(forKey: provider)
+            Task {
+                let models = provider == .anthropic ? await VertexAI.fetchClaudeModels()
+                                                    : await VertexAI.fetchGeminiModels()
+                loadingProviderModels.remove(provider)
+                if models.isEmpty {
+                    providerModelFetchError[provider] = "Failed to load models from Vertex AI. Check the project and `gcloud auth application-default login`."
+                } else {
+                    fetchedProviderModels[provider] = models
+                    if provider == .anthropic, !models.contains(where: { $0.id == claudeModel }) {
+                        claudeModel = models.first(where: { $0.id == AppState.defaultClaudeModel })?.id
+                            ?? models.first(where: { $0.id.contains("sonnet") })?.id ?? models.first!.id
+                    }
+                    if provider == .google, !models.contains(where: { $0.id == googleChatModel }) {
+                        googleChatModel = models.first(where: { $0.id.contains("flash") })?.id ?? models.first!.id
+                    }
                 }
             }
             return
